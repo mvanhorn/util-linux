@@ -57,6 +57,30 @@ ts_init_subtest rtc
 if [ -c /dev/rtc0 ] && [ -r /dev/rtc0 ]; then
 	"$TS_CMD_LSCLOCKS" $NO_DISCOVER --rtc /dev/rtc0 --output TYPE,ID,CLOCK,NAME \
 		| tail -1 > "$TS_OUTPUT" 2>> "$TS_ERRLOG"
+
+	if ! rtc_time_utc=$(TZ=UTC0 "$TS_CMD_LSCLOCKS" $NO_DISCOVER --rtc /dev/rtc0 \
+			--noheadings --raw --output TIME 2>> "$TS_ERRLOG"); then
+		ts_failed "could not read /dev/rtc0 in UTC"
+	elif ! rtc_time_offset=$(TZ=UTC+11 "$TS_CMD_LSCLOCKS" $NO_DISCOVER --rtc /dev/rtc0 \
+			--noheadings --raw --output TIME 2>> "$TS_ERRLOG"); then
+		ts_failed "could not read /dev/rtc0 with fixed timezone offset"
+	else
+		rtc_time_utc=${rtc_time_utc##*$'\n'}
+		rtc_time_offset=${rtc_time_offset##*$'\n'}
+		if [[ ! "$rtc_time_utc" =~ ^[0-9]+\.[0-9]{9}$ ]] ||
+		   [[ ! "$rtc_time_offset" =~ ^[0-9]+\.[0-9]{9}$ ]]; then
+			ts_failed "invalid RTC timestamps: $rtc_time_utc $rtc_time_offset"
+		else
+			rtc_time_utc=${rtc_time_utc%%.*}
+			rtc_time_offset=${rtc_time_offset%%.*}
+			rtc_drift=$((rtc_time_offset - rtc_time_utc))
+			if [ "$rtc_drift" -lt 0 ]; then
+				ts_failed "RTC timestamp moved backwards by $((-rtc_drift)) seconds"
+			elif [ "$rtc_drift" -gt 2 ]; then
+				ts_failed "RTC timestamp drifted by $rtc_drift seconds"
+			fi
+		fi
+	fi
 else
 	ts_skip "/dev/rtc0 not usable"
 fi
