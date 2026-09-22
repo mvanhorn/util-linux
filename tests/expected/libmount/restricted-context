@@ -1,0 +1,26 @@
+root: restricted=0 ruid0=1 euid0=1 secure=0
+set-null: einval
+root-force-initial: restricted=0
+root-set:1 restricted=1
+root-force: restricted=0
+root-set:0 restricted=0
+root-force-clear: restricted=0
+root-set:2 restricted=1
+root-set:-1 restricted=1
+root-fresh: restricted=0
+child-euid: restricted=1 ruid0=1 euid0=0 secure=0
+child-drop: restricted=1 ruid0=0 euid0=0 secure=0
+child-drop-set:1 restricted=1
+child-drop-force: restricted=0
+child-drop-set:0 restricted=0
+child-drop-set:2 restricted=1
+child-drop-fresh: restricted=1
+user: restricted=1 ruid0=0 euid0=0 secure=0
+user-set:1 restricted=1
+user-force: restricted=0
+user-set:0 restricted=0
+user-set:2 restricted=1
+user-fresh: restricted=1
+suid-initial: restricted=1 ruid0=0 euid0=1 secure=1
+suid-kept: restricted=1
+suid-after: restricted=0 ruid0=1 euid0=1 secure=1

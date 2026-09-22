@@ -783,6 +783,15 @@ int main(int argc, char **argv)
 	if (!cxt)
 		err(MNT_EX_SYSERR, _("libmount context allocation failed"));
 
+	/*
+	 * Execution-time policy belongs here, not in the library. Force the
+	 * non-root policy for AT_SECURE (set-user-ID, set-group-ID, file
+	 * capabilities). Never clear a constructor restriction just because
+	 * AT_SECURE is zero: an ordinary non-root process stays restricted.
+	 */
+	if (is_privileged_execution())
+		mnt_context_set_restricted(cxt, 1);
+
 	mnt_context_set_tables_errcb(cxt, table_parser_errcb);
 
 	while ((c = getopt_long(argc, argv, "aBcfFhilL:m::Mno:O:rRsU:vVwt:T:N:",

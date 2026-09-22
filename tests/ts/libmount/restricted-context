@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+# Credential policy for libmount contexts, plus the mount(8)/umount(8)
+# execution-time restriction that must stay in the command-line tools.
+
+TS_TOPDIR="${0%/*}/../.."
+TS_DESC="restricted context"
+
+. "$TS_TOPDIR"/functions.sh
+ts_init "$*"
+
+ts_skip_nonroot
+ts_check_prog "getent"
+ts_check_prog "mount"
+ts_check_prog "umount"
+ts_check_test_command "$TS_CMD_SETPRIV"
+ts_check_test_command "$TS_HELPER_LIBMOUNT_CONTEXT"
+
+[ -x "$TS_HELPER_LIBMOUNT_CONTEXT" ] || ts_skip "test not compiled"
+
+grep -q 'nodev[[:space:]]*tmpfs' /proc/filesystems \
+	|| ts_skip "tmpfs unsupported"
+
+getent passwd "$TS_TESTUSER" >/dev/null 2>&1 \
+	|| ts_skip "$TS_TESTUSER user is missing"
+
+tuid=$(getent passwd "$TS_TESTUSER" | cut -d: -f3)
+tgid=$(getent passwd "$TS_TESTUSER" | cut -d: -f4)
+[ -n "$tuid" ] && [ "$tuid" != "0" ] || ts_skip "no non-root test uid"
+[ -n "$tgid" ] || ts_skip "no test user gid"
+
+# Resolve the real test ELF. A libtool wrapper cannot be set-user-ID, and
+# secure execution ignores LD_LIBRARY_PATH, so the copy has to be the
+# existing statically linked binary.
+is_elf() {
+	local sig
+
+	[ -f "$1" ] || return 1
+	# shellcheck disable=SC2162
+	IFS= read -r -N 4 sig < "$1" || true
+	[ "$sig" = $'\177ELF' ]
+}
+
+resolve_elf() {
+	local p="$1" dir base cand
+
+	if is_elf "$p"; then
+		printf '%s\n' "$p"
+		return 0
+	fi
+
+	dir=$(dirname "$p")
+	base=$(basename "$p")
+	for cand in "$dir/.libs/$base" "$dir/.libs/lt-$base"; do
+		if is_elf "$cand"; then
+			printf '%s\n' "$cand"
+			return 0
+		fi
+	done
+	return 1
+}
+
+ELF=$(resolve_elf "$TS_HELPER_LIBMOUNT_CONTEXT") \
+	|| ts_skip "context test ELF not found"
+
+SUID_COPY=""
+SGID_MOUNT=""
+SGID_UMOUNT=""
+
+cleanup() {
+	rm -f "$SUID_COPY" "$SGID_MOUNT" "$SGID_UMOUNT"
+	umount "$TS_MOUNTPOINT" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+mkdir -p "$TS_MOUNTPOINT"
+if ! mount -t tmpfs tmpfs "$TS_MOUNTPOINT" >/dev/null 2>&1; then
+	ts_skip "tmpfs mount failed"
+fi
+
+SUID_COPY="$TS_MOUNTPOINT/test_mount_context"
+cp -f "$ELF" "$SUID_COPY"
+chown 0:0 "$SUID_COPY"
+chmod 4755 "$SUID_COPY"
+if [ ! -u "$SUID_COPY" ] || [ ! -x "$SUID_COPY" ] || ! is_elf "$SUID_COPY"; then
+	ts_skip "suid unsupported on filesystem"
+fi
+
+unset LIBMOUNT_DEBUG
+unset LIBMOUNT_FSTAB
+
+run_case() {
+	local out rc reason
+
+	out=$(env -u LIBMOUNT_DEBUG -u LIBMOUNT_FSTAB "$@" 2>>"$TS_ERRLOG")
+	rc=$?
+	if printf '%s\n' "$out" | grep -q '^SKIP:'; then
+		reason=$(printf '%s\n' "$out" | sed -n 's/^SKIP: //p' | head -n 1)
+		ts_skip "${reason:-credential change unsupported}"
+	fi
+	printf '%s\n' "$out" >> "$TS_OUTPUT"
+	if [ "$rc" -ne 0 ]; then
+		ts_die "restricted context case failed"
+	fi
+}
+
+# Ordinary root, then an ordinary unprivileged exec (AT_SECURE clear),
+# then the set-user-ID copy as the test user.
+run_case "$ELF" --restricted "$tuid"
+run_case "$TS_CMD_SETPRIV" --reuid="$tuid" --regid="$tgid" \
+	--clear-groups --inh-caps=-all --reset-env \
+	-- "$ELF" --restricted-user
+run_case "$TS_CMD_SETPRIV" --reuid="$tuid" --regid="$tgid" \
+	--clear-groups --inh-caps=-all --reset-env \
+	-- "$SUID_COPY" --restricted-suid
+
+# mount(8) / umount(8): missing fstab and forbidden options. Output stays
+# out of the expected file; a policy mismatch fails the test.
+SRC=/no/such/dev/restricted-context
+TGT=/no/such/mnt/restricted-context
+TAG=LABEL=restricted-context-not-a-label
+
+as_user() {
+	"$TS_CMD_SETPRIV" --reuid="$tuid" --regid="$tgid" \
+		--clear-groups --inh-caps=-all -- "$@"
+}
+
+# kind is fstab, nofstab, dropped, tags, or notags.
+# The command may be a shell function, so it is not invoked through env(1).
+check_tool() {
+	local kind="$1"
+	shift
+	local out rc ok=0
+
+	out=$("$@" 2>&1)
+	rc=$?
+
+	case "$kind" in
+	fstab)
+		if printf '%s\n' "$out" | grep -q "can't find in" && [ "$rc" -ne 0 ]; then
+			ok=1
+		fi
+		;;
+	nofstab)
+		if ! printf '%s\n' "$out" | grep -q "can't find in" && [ "$rc" -ne 0 ]; then
+			ok=1
+		fi
+		;;
+	dropped)
+		if ! printf '%s\n' "$out" | grep -q "can't find in"; then
+			ok=1
+		fi
+		;;
+	tags)
+		if printf '%s\n' "$out" | grep -q "tags are not allowed"; then
+			ok=1
+		fi
+		;;
+	notags)
+		if ! printf '%s\n' "$out" | grep -q "tags are not allowed"; then
+			ok=1
+		fi
+		;;
+	esac
+
+	if [ "$ok" -ne 1 ]; then
+		printf '%s\n' "$out" >> "$TS_ERRLOG"
+		return 1
+	fi
+	return 0
+}
+
+require_tool() {
+	check_tool "$@" || ts_die "tool restriction mismatch: $*"
+}
+
+if [ -x "$TS_CMD_MOUNT" ] && [ -x "$TS_CMD_UMOUNT" ]; then
+	# Ordinary root stays unrestricted. -f is a forbidden option only
+	# while the context is restricted, so a fake root mount must not
+	# take the missing-fstab path either.
+	require_tool nofstab "$TS_CMD_MOUNT" -i "$SRC" "$TGT"
+	require_tool dropped "$TS_CMD_MOUNT" -f "$SRC" "$TGT"
+	require_tool notags "$TS_CMD_UMOUNT" "$TAG"
+
+	# Ordinary non-root stays restricted. A forbidden option drops that
+	# policy and continues with kernel checks.
+	require_tool fstab as_user "$TS_CMD_MOUNT" -i "$SRC" "$TGT"
+	require_tool dropped as_user "$TS_CMD_MOUNT" -f "$SRC" "$TGT"
+	require_tool tags as_user "$TS_CMD_UMOUNT" "$TAG"
+	require_tool notags as_user "$TS_CMD_UMOUNT" -n "$TAG"
+
+	# Root UID with a set-group-ID binary: AT_SECURE must keep the tools
+	# restricted until a forbidden option intentionally drops the policy.
+	root_gid=$(id -g)
+	sgid=""
+	while IFS=: read -r _name _pw gid _rest; do
+		if [ -n "$gid" ] && [ "$gid" != "$root_gid" ]; then
+			sgid=$gid
+			break
+		fi
+	done < <(getent group)
+
+	install_sgid() {
+		local src="$1" dst="$2" elf
+
+		elf=$(resolve_elf "$src") || return 1
+		cp -f "$elf" "$dst" || return 1
+		chown 0:"$sgid" "$dst" || return 1
+		chmod 2755 "$dst" || return 1
+		[ -g "$dst" ] && is_elf "$dst"
+	}
+
+	if [ -n "$sgid" ]; then
+		if [ -e "$TS_CMD_MOUNTSTATIC" ]; then
+			SGID_MOUNT="$TS_MOUNTPOINT/mount.static"
+			if install_sgid "$TS_CMD_MOUNTSTATIC" "$SGID_MOUNT"; then
+				require_tool fstab "$SGID_MOUNT" -i "$SRC" "$TGT"
+				require_tool dropped "$SGID_MOUNT" -f "$SRC" "$TGT"
+			fi
+		fi
+		umount_static="${ts_commandsdir}umount.static"
+		if [ -e "$umount_static" ]; then
+			SGID_UMOUNT="$TS_MOUNTPOINT/umount.static"
+			if install_sgid "$umount_static" "$SGID_UMOUNT"; then
+				require_tool tags "$SGID_UMOUNT" "$TAG"
+				require_tool notags "$SGID_UMOUNT" -n "$TAG"
+			fi
+		fi
+	fi
+fi
+
+ts_finalize

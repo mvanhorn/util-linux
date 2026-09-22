@@ -50,18 +50,23 @@
 /**
  * mnt_new_context:
  *
+ * The context is unrestricted only when both the real and the effective UID
+ * are zero. Any other credential combination stays restricted. Execution-time
+ * restrictions (AT_SECURE) are not applied here; see mnt_context_set_restricted().
+ *
  * Returns: newly allocated mount context
  */
 struct libmnt_context *mnt_new_context(void)
 {
 	struct libmnt_context *cxt;
-	uid_t ruid;
+	uid_t ruid, euid;
 
 	cxt = calloc(1, sizeof(*cxt));
 	if (!cxt)
 		return NULL;
 
 	ruid = getuid();
+	euid = geteuid();
 
 	mnt_context_reset_status(cxt);
 
@@ -76,8 +81,13 @@ struct libmnt_context *mnt_new_context(void)
 	INIT_LIST_HEAD(&cxt->hooksets_hooks);
 	INIT_LIST_HEAD(&cxt->hooksets_datas);
 
-	/* if we're really root and aren't running setuid */
-	cxt->restricted = (uid_t) 0 == ruid && !is_privileged_execution() ? 0 : 1;
+	/*
+	 * Unrestricted only for real root: both real and effective UIDs are
+	 * zero. A set-user-ID helper that has not called setuid(0), and root
+	 * with a dropped effective UID, stay restricted. AT_SECURE is the
+	 * caller's policy (mount(8) and umount(8) set it explicitly).
+	 */
+	cxt->restricted = ((uid_t) 0 == ruid && (uid_t) 0 == euid) ? 0 : 1;
 
 	cxt->noautofs = 0;
 
@@ -401,7 +411,9 @@ static int set_flag(struct libmnt_context *cxt, int flag, int enable)
  * mnt_context_is_restricted:
  * @cxt: mount context
  *
- * Returns: 0 for an unrestricted mount (user is root), or 1 for non-root mounts
+ * Returns: 0 for an unrestricted context, or 1 when the non-root security
+ * policy is in effect. The default follows the UIDs at mnt_new_context()
+ * time; see mnt_context_set_restricted().
  */
 int mnt_context_is_restricted(struct libmnt_context *cxt)
 {
@@ -572,6 +584,9 @@ void mnt_context_close_target_fd(struct libmnt_context *cxt)
  * This function is designed for case you have no any suid permissions, so you
  * can depend on kernel.
  *
+ * See mnt_context_set_restricted() for the general setter. This function only
+ * clears the flag.
+ *
  * Returns: 0 on success, negative number in case of error.
  *
  * Since: 2.35
@@ -583,6 +598,46 @@ int mnt_context_force_unrestricted(struct libmnt_context *cxt)
 		cxt->restricted = 0;
 	}
 
+	return 0;
+}
+
+/**
+ * mnt_context_set_restricted:
+ * @cxt: mount context
+ * @restricted: 0 to clear the flag, or any non-zero value to set it
+ *
+ * Enables or disables the userspace non-root security policy. A non-zero
+ * @restricted is stored as 1.
+ *
+ * Restricted mode requires an fstab entry, sanitizes paths and rejects
+ * options that are reserved for root. mnt_new_context() initializes the
+ * flag from the current credentials: unrestricted only when both the real
+ * and the effective UID are zero. It does not look at execution-time
+ * restrictions such as AT_SECURE, set-user-ID or set-group-ID.
+ *
+ * Call this once, immediately after mnt_new_context(), before option
+ * parsing or any mount or umount decision. Changing the flag later does
+ * not undo work already performed under the previous policy.
+ *
+ * Clearing the flag disables libmount's userspace checks and leaves
+ * permission checks to the kernel. Do not clear it while the process is
+ * still privileged (for example a set-user-ID helper that has not dropped
+ * its credentials). Programs that must stay restricted for the whole
+ * execution, such as mount(8) and umount(8), set the flag from their own
+ * execution-time policy and must not clear a non-root default just because
+ * AT_SECURE is zero.
+ *
+ * Returns: 0 on success, negative number in case of error.
+ *
+ * Since: 2.43
+ */
+int mnt_context_set_restricted(struct libmnt_context *cxt, int restricted)
+{
+	if (!cxt)
+		return -EINVAL;
+
+	cxt->restricted = restricted ? 1 : 0;
+	DBG_OBJ(CXT, cxt, ul_debug("set restricted=%d", cxt->restricted));
 	return 0;
 }
 
@@ -4131,9 +4186,368 @@ done:
 	return rc;
 }
 
+/*
+ * Credential policy checks. Children are used so a dropped UID cannot leak
+ * into the next case. Return 2 when the credential syscall is unavailable
+ * (distinct from an assertion failure, which returns 1).
+ */
+static int test_skip(const char *reason)
+{
+	printf("SKIP: %s\n", reason);
+	return 0;
+}
+
+static int test_cred_unsupported(int err)
+{
+	/*
+	 * EPERM/EACCES: no privilege to change credentials.
+	 * EINVAL: uid is not mapped in this user namespace.
+	 * ENOSYS/EOPNOTSUPP: the syscall is missing.
+	 */
+	return err == EPERM || err == EACCES || err == EINVAL
+		|| err == ENOSYS || err == EOPNOTSUPP;
+}
+
+static int parse_test_uid(const char *str, uid_t *uid)
+{
+	char *end = NULL;
+	unsigned long n;
+
+	if (!str || !*str)
+		return -EINVAL;
+
+	errno = 0;
+	n = strtoul(str, &end, 10);
+	if (errno || !end || *end || end == str || n == 0)
+		return -EINVAL;
+	if ((unsigned long) (uid_t) n != n)
+		return -EINVAL;
+
+	*uid = (uid_t) n;
+	return 0;
+}
+
+static void test_creds_line(const char *tag, int restricted)
+{
+	printf("%s: restricted=%d ruid0=%d euid0=%d secure=%d\n",
+		tag, restricted,
+		getuid() == (uid_t) 0,
+		geteuid() == (uid_t) 0,
+		is_privileged_execution() ? 1 : 0);
+}
+
+static int test_report_new(const char *tag, int want)
+{
+	struct libmnt_context *cxt;
+	int got;
+
+	cxt = mnt_new_context();
+	if (!cxt)
+		return -ENOMEM;
+
+	got = mnt_context_is_restricted(cxt);
+	test_creds_line(tag, got);
+	mnt_free_context(cxt);
+	return got == want ? 0 : -EINVAL;
+}
+
+static int test_set_flag(struct libmnt_context *cxt, const char *tag,
+			 int value, int want)
+{
+	int rc, got;
+
+	rc = mnt_context_set_restricted(cxt, value);
+	got = rc == 0 ? mnt_context_is_restricted(cxt) : rc;
+	printf("%s: restricted=%d\n", tag, got);
+	if (rc != 0 || got != want)
+		return -EINVAL;
+	return 0;
+}
+
+static int test_force_flag(struct libmnt_context *cxt, const char *tag, int want)
+{
+	int rc, got;
+
+	rc = mnt_context_force_unrestricted(cxt);
+	got = mnt_context_is_restricted(cxt);
+	printf("%s: restricted=%d\n", tag, got);
+	if (rc != 0 || got != want)
+		return -EINVAL;
+	return 0;
+}
+
+/* Setter transitions on one real context, then a fresh constructor. */
+static int test_exercise_setter(const char *prefix, int fresh_want)
+{
+	struct libmnt_context *cxt;
+	char tag[64];
+	int rc, got;
+
+	cxt = mnt_new_context();
+	if (!cxt)
+		return -ENOMEM;
+
+	snprintf(tag, sizeof(tag), "%s-set:1", prefix);
+	rc = test_set_flag(cxt, tag, 1, 1);
+	if (!rc) {
+		snprintf(tag, sizeof(tag), "%s-force", prefix);
+		rc = test_force_flag(cxt, tag, 0);
+	}
+	if (!rc) {
+		snprintf(tag, sizeof(tag), "%s-set:0", prefix);
+		rc = test_set_flag(cxt, tag, 0, 0);
+	}
+	if (!rc && strcmp(prefix, "root") == 0)
+		rc = test_force_flag(cxt, "root-force-clear", 0);
+	if (!rc) {
+		snprintf(tag, sizeof(tag), "%s-set:2", prefix);
+		rc = test_set_flag(cxt, tag, 2, 1);
+	}
+	if (!rc && strcmp(prefix, "root") == 0)
+		rc = test_set_flag(cxt, "root-set:-1", -1, 1);
+	mnt_free_context(cxt);
+	if (rc)
+		return rc;
+
+	cxt = mnt_new_context();
+	if (!cxt)
+		return -ENOMEM;
+	got = mnt_context_is_restricted(cxt);
+	printf("%s-fresh: restricted=%d\n", prefix, got);
+	mnt_free_context(cxt);
+	return got == fresh_want ? 0 : -EINVAL;
+}
+
+/* Root with a non-zero effective UID stays restricted. */
+static int child_euid(uid_t uid)
+{
+	struct libmnt_context *cxt;
+	int got;
+
+	if (seteuid(uid) != 0)
+		return test_cred_unsupported(errno) ? 2 : 1;
+	if (getuid() != (uid_t) 0 || geteuid() != uid || is_privileged_execution()) {
+		printf("child-euid: credential mismatch\n");
+		return 1;
+	}
+
+	cxt = mnt_new_context();
+	if (!cxt)
+		return 1;
+	got = mnt_context_is_restricted(cxt);
+	test_creds_line("child-euid", got);
+	mnt_free_context(cxt);
+	return got == 1 ? 0 : 1;
+}
+
+/*
+ * Ordinary unprivileged process (AT_SECURE clear). setuid(0) must fail
+ * after the drop; that distinguishes a missed credential change from a
+ * wrong restricted flag.
+ */
+static int child_drop(uid_t uid)
+{
+	struct libmnt_context *cxt;
+	int got, rc;
+
+	if (setuid(uid) != 0)
+		return test_cred_unsupported(errno) ? 2 : 1;
+	if (getuid() != uid || geteuid() != uid || is_privileged_execution()) {
+		printf("child-drop: credential mismatch\n");
+		return 1;
+	}
+	if (setuid(0) == 0) {
+		printf("child-drop: setuid(0) succeeded after drop\n");
+		return 1;
+	}
+	if (!test_cred_unsupported(errno)) {
+		printf("child-drop: unexpected setuid(0) errno\n");
+		return 1;
+	}
+
+	cxt = mnt_new_context();
+	if (!cxt)
+		return 1;
+	got = mnt_context_is_restricted(cxt);
+	test_creds_line("child-drop", got);
+	mnt_free_context(cxt);
+	if (got != 1)
+		return 1;
+
+	rc = test_exercise_setter("child-drop", 1);
+	return rc == 0 ? 0 : 1;
+}
+
+static int run_as_child(int (*fn)(uid_t), uid_t uid)
+{
+	pid_t pid;
+	int status;
+
+	fflush(stdout);
+	fflush(stderr);
+
+	pid = fork();
+	if (pid < 0) {
+		warn("fork");
+		return -errno;
+	}
+	if (pid == 0) {
+		int rc = fn(uid);
+
+		fflush(stdout);
+		fflush(stderr);
+		if (rc == 0)
+			_exit(0);
+		_exit(rc == 2 ? 2 : 1);
+	}
+
+	if (waitpid(pid, &status, 0) != pid) {
+		warn("waitpid");
+		return -errno;
+	}
+	if (!WIFEXITED(status))
+		return -ECHILD;
+	if (WEXITSTATUS(status) == 2)
+		return 2;
+	if (WEXITSTATUS(status) != 0)
+		return -EINVAL;
+	return 0;
+}
+
+static int test_restricted(struct libmnt_test *ts __attribute__((unused)),
+			   int argc, char *argv[])
+{
+	struct libmnt_context *cxt;
+	uid_t uid;
+	int rc;
+
+	if (argc < 2)
+		return -EINVAL;
+	if (parse_test_uid(argv[1], &uid) != 0)
+		return -EINVAL;
+
+	if (getuid() != (uid_t) 0 || geteuid() != (uid_t) 0)
+		return test_skip("root credentials required");
+	if (is_privileged_execution())
+		return test_skip("AT_SECURE set on ordinary root invocation");
+
+	rc = test_report_new("root", 0);
+	if (rc)
+		return rc;
+
+	rc = mnt_context_set_restricted(NULL, 1);
+	printf("set-null: %s\n", rc == -EINVAL ? "einval" : "unexpected");
+	if (rc != -EINVAL)
+		return -EINVAL;
+
+	/* Prove force_unrestricted() on a context that starts unrestricted. */
+	cxt = mnt_new_context();
+	if (!cxt)
+		return -ENOMEM;
+	rc = test_force_flag(cxt, "root-force-initial", 0);
+	mnt_free_context(cxt);
+	if (rc)
+		return rc;
+
+	rc = test_exercise_setter("root", 0);
+	if (rc)
+		return rc;
+
+	rc = run_as_child(child_euid, uid);
+	if (rc == 2)
+		return test_skip("credential change unsupported");
+	if (rc)
+		return rc;
+
+	rc = run_as_child(child_drop, uid);
+	if (rc == 2)
+		return test_skip("credential change unsupported");
+	return rc;
+}
+
+static int test_restricted_user(struct libmnt_test *ts __attribute__((unused)),
+				int argc __attribute__((unused)),
+				char *argv[] __attribute__((unused)))
+{
+	int rc;
+
+	if (getuid() == (uid_t) 0 || geteuid() == (uid_t) 0 ||
+	    is_privileged_execution())
+		return test_skip("unprivileged credentials required");
+
+	rc = test_report_new("user", 1);
+	if (rc)
+		return rc;
+	return test_exercise_setter("user", 1);
+}
+
+/*
+ * Executed as a set-user-ID root binary by a non-root user. The initial
+ * context is restricted; after setuid(0) a new context is unrestricted
+ * even though AT_SECURE stays set.
+ */
+static int test_restricted_suid(struct libmnt_test *ts __attribute__((unused)),
+				int argc __attribute__((unused)),
+				char *argv[] __attribute__((unused)))
+{
+	struct libmnt_context *cxt, *neu;
+	int got, err;
+
+	cxt = mnt_new_context();
+	if (!cxt)
+		return -ENOMEM;
+
+	got = mnt_context_is_restricted(cxt);
+	test_creds_line("suid-initial", got);
+
+	if (getuid() == (uid_t) 0) {
+		mnt_free_context(cxt);
+		return -EINVAL;
+	}
+	if (geteuid() != (uid_t) 0 || !is_privileged_execution()) {
+		mnt_free_context(cxt);
+		return test_skip("setuid exec did not raise privileges");
+	}
+	if (got != 1) {
+		mnt_free_context(cxt);
+		return -EINVAL;
+	}
+
+	if (setuid(0) != 0) {
+		err = errno;
+		mnt_free_context(cxt);
+		if (test_cred_unsupported(err))
+			return test_skip("setuid(0) not permitted");
+		warn("setuid");
+		return -err;
+	}
+	if (getuid() != (uid_t) 0 || geteuid() != (uid_t) 0 ||
+	    !is_privileged_execution()) {
+		mnt_free_context(cxt);
+		return -EINVAL;
+	}
+
+	got = mnt_context_is_restricted(cxt);
+	printf("suid-kept: restricted=%d\n", got);
+	mnt_free_context(cxt);
+	if (got != 1)
+		return -EINVAL;
+
+	neu = mnt_new_context();
+	if (!neu)
+		return -ENOMEM;
+	got = mnt_context_is_restricted(neu);
+	test_creds_line("suid-after", got);
+	mnt_free_context(neu);
+	return got == 0 ? 0 : -EINVAL;
+}
+
 int main(int argc, char *argv[])
 {
 	struct libmnt_test tss[] = {
+	{ "--restricted", test_restricted, "<non-root-uid>" },
+	{ "--restricted-user", test_restricted_user, "" },
+	{ "--restricted-suid", test_restricted_suid, "" },
 	{ "--mount",  test_mount,  "[-o <opts>] [-t <type>] <spec>|<src> <target>" },
 	{ "--umount", test_umount, "[-t <type>] [-f][-l][-r] <src>|<target>" },
 	{ "--mount-all", test_mountall,  "[-O <pattern>] [-t <pattern] mount all filesystems from fstab" },
